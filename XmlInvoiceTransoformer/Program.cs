@@ -12,13 +12,12 @@ namespace XmlInvoiceTransoformer
         {
             Console.WriteLine("== XML Invoice Transformer ==\n");
 
-            string inputFilePath = Path.GetDirectoryName(Environment.CurrentDirectory);
+            string inputFilePath = Path.Combine(Path.GetDirectoryName(Environment.CurrentDirectory), "input");
             string outputFilePath = Path.Combine(inputFilePath, "output");
 
             if (!File.Exists(inputFilePath))
             {
-                Console.WriteLine($"Error: Input file not found {inputFilePath}");
-                return;
+                Directory.CreateDirectory(inputFilePath);
             }
 
             try
