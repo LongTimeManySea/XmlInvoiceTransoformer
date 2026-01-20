@@ -1,686 +1,387 @@
-﻿using System.Globalization;
-using System.Xml.Linq;
+﻿using Microsoft.Extensions.Logging;
+using System;
+using System.IO;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace XmlInvoiceTransoformer
+namespace XmlInvoiceTransformer
 {
     class Program
     {
-        private static readonly XNamespace DefaultNs = "urn:schemas-basda-org:2000: salesInvoice:xdr: 3. 01";
-        private static readonly XNamespace OpNs = "urn:schemas-bossfed-co-uk: OP-Invoice-v1";
+        private static AppSettings _settings = new();
+        private static ILogger<Program>? _logger;
+        private static InvoiceProcessor? _processor;
+        private static EmailService? _emailService;
+        private static readonly CancellationTokenSource _cancellationTokenSource = new();
 
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
-            Console.WriteLine("== XML Invoice Transformer ==\n");
+            // Load configuration
+            LoadConfiguration();
 
-            string inputFilePath = Path.Combine(Path.GetDirectoryName(Environment.CurrentDirectory), "input");
-            string outputFilePath = Path.Combine(inputFilePath, "output");
-
-            if (!File.Exists(inputFilePath))
+            // Setup logging
+            using var loggerFactory = LoggerFactory.Create(builder =>
             {
-                Directory.CreateDirectory(inputFilePath);
+                builder
+                    .AddConsole(options =>
+                    {
+                        options.TimestampFormat = "[yyyy-MM-dd HH:mm:ss] ";
+                    })
+                    .AddProvider(new FileLoggerProvider(_settings.FolderSettings.LogFolder))
+                    .SetMinimumLevel(LogLevel.Information);
+            });
+
+            _logger = loggerFactory.CreateLogger<Program>();
+            var processorLogger = loggerFactory.CreateLogger<InvoiceProcessor>();
+            var emailLogger = loggerFactory.CreateLogger<EmailService>();
+
+            _logger.LogInformation("===========================================");
+            _logger.LogInformation("   XML Invoice Transformer Service");
+            _logger.LogInformation("===========================================");
+
+            // Ensure all directories exist
+            EnsureDirectoriesExist();
+
+            // Create email service
+            _emailService = new EmailService(_settings.EmailSettings, emailLogger);
+
+            // Create the processor
+            _processor = new InvoiceProcessor(
+                processorLogger,
+                _settings.FolderSettings.OutputFolder,
+                _settings.FolderSettings.ArchiveFolder,
+                _settings.FolderSettings.ErrorFolder,
+                _settings.FolderSettings.ArchiveProcessedFiles,
+                _emailService
+            );
+
+            LogConfiguration();
+
+            // Handle command line arguments
+            if (args.Length > 0 && args[0].ToLower() == "--test-email")
+            {
+                await TestEmailConfiguration();
+                return;
             }
 
+            // Handle graceful shutdown
+            Console.CancelKeyPress += async (sender, e) =>
+            {
+                e.Cancel = true;
+                _logger.LogInformation("Shutdown requested...");
+
+                // Send daily summary before shutting down if there were any files processed
+                if (_emailService.TodaysSuccessCount > 0 || _emailService.TodaysErrorCount > 0)
+                {
+                    _logger.LogInformation("Sending final summary email...");
+                    await _emailService.SendDailySummaryAsync();
+                }
+
+                _cancellationTokenSource.Cancel();
+            };
+
+            // Process any existing files in the input folder
+            await ProcessExistingFilesAsync();
+
+            // Start watching for new files (this also handles daily summary)
+            await WatchForFilesAsync(_cancellationTokenSource.Token);
+
+            _logger.LogInformation("Service stopped.");
+        }
+
+        private static void LoadConfiguration()
+        {
+            var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings. json");
+
+            if (File.Exists(configPath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(configPath);
+                    _settings = JsonSerializer.Deserialize<AppSettings>(json, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    }) ?? new AppSettings();
+
+                    Console.WriteLine($"Configuration loaded from: {configPath}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Warning: Failed to load configuration:  {ex.Message}");
+                    Console.WriteLine("Using default settings.");
+                    _settings = new AppSettings();
+                }
+            }
+            else
+            {
+                Console.WriteLine($"Configuration file not found at: {configPath}");
+                Console.WriteLine("Creating default configuration file.. .");
+
+                _settings = new AppSettings();
+                SaveDefaultConfiguration(configPath);
+            }
+        }
+
+        private static void SaveDefaultConfiguration(string configPath)
+        {
             try
             {
-                Console.WriteLine($"\nReading input file: {inputFilePath}");
-                XDocument inputDoc = XDocument.Load(inputFilePath);
-
-                Console.WriteLine("Transforming to blueprint format...");
-                XDocument outputDoc = TransformToBlueprint(inputDoc);
-
-                Console.WriteLine($"Saving output file: {outputFilePath}");
-                outputDoc.Save(outputFilePath);
-
-                Console.WriteLine("\n✓ Transformation completed successfully!");
-                Console.WriteLine($"Output sace to: {Path.GetFullPath(outputFilePath)}");
+                var json = JsonSerializer.Serialize(_settings, new JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
+                File.WriteAllText(configPath, json);
+                Console.WriteLine($"Default configuration saved to: {configPath}");
+                Console.WriteLine("Please edit this file to configure your settings.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"\nError during transformation: {ex.Message}");
-                Console.WriteLine($"Stack trace: {ex.Message}");
+                Console.WriteLine($"Warning: Could not save default configuration: {ex.Message}");
             }
         }
 
-        private static string GetDefaultOutputPath(string inputPath)
+        private static void EnsureDirectoriesExist()
         {
-            string directory = Path.GetDirectoryName(inputPath) ?? ".";
-            string fileName = Path.GetFileNameWithoutExtension(inputPath);
-            return Path.Combine(directory, $"{fileName}_Transformed.xml");
-        }
-
-        private static XDocument TransformToBlueprint(XDocument input)
-        {
-            var root = input.Root;
-            if (root == null)
-                throw new InvalidOperationException("Input XML has no root element");
-
-            var data = new InvoiceData(root);
-
-            var invoice = new XElement(DefaultNs + "Invoice",
-                CreateInvoiceHead(data),
-                CreateInvoiceReference(data),
-                CreateAdditionalInvoiceReference(data),
-                CreateAdditionalInvoiceDates(data),
-                new XElement(DefaultNs + "InvoiceData", data.InvoiceDate),
-                CreateSupplier(data),
-                CreateBuyer(data),
-                CreateInvoiceTo(data),
-                CreateInvoiceLines(data),
-                CreateSettlement(data),
-                CreateTaxSubTotals(data),
-                CreateInvoiceTotal(data)
-            );
-
-            return new XDocument(new XDeclaration("1.0", "utf-8", null), invoice);
-        }
-
-        #region Invoice Head Section
-
-        private static XElement CreateInvoiceHead(InvoiceData data)
-        {
-            return new XElement(DefaultNs + "InvoiceHead",
-                new XElement(DefaultNs + "Schema",
-                    new XElement(DefaultNs + "Version", "3.05")
-                    ),
-                    new XElement(DefaultNs + "Parameters",
-                        new XElement(DefaultNs + "Language", "en-GB"),
-                        new XElement(DefaultNs + "DecimalSeparator", ". "),
-                        new XElement(DefaultNs + "Precision", "20.4")
-                    ),
-                    new XElement(DefaultNs + "InvoiceType",
-                        new XAttribute("Code", "INV"),
-                        "Commercial Invoice"
-                    ),
-                    new XElement(DefaultNs + "InvoiceCurrency",
-                        new XElement(DefaultNs + "Currency",
-                            new XAttribute("Code", data.CurrencyCode),
-                            data.CurrencyName
-                        )
-                    ),
-                    new XElement(DefaultNs + "Checksum", GenerateCheckSum(data))
-                );
-        }
-
-        private static string GenerateCheckSum(InvoiceData data)
-        {
-            int checksum = Math.Abs((data.InvoiceNumber + data.GrossTotal.ToString()).GetHashCode() % 100000);
-            return checksum.ToString();
-        }
-
-        #endregion
-
-        #region Reference Section
-
-        private static XElement CreateInvoiceReference(InvoiceData data)
-        {
-            return new XElement(DefaultNs + "InvoiceReferences",
-                new XElement(DefaultNs + "BuyersOrderNumber", data.CustomerOrderNumber),
-                new XElement(DefaultNs + "SuppliersInvoiceNumber", data.InvoiceNumber),
-                new XElement(DefaultNs + "DeliveryNoteNumber", data.DespatchNumber)
-            );
-        }
-
-        private static XElement CreateAdditionalInvoiceReference(InvoiceData data)
-        {
-            return new XElement(OpNs + "AdditionalInvoiceReferences",
-                new XElement(OpNs + "InvoiceReference",
-                    new XAttribute("ReferenceType", "KWOS"),
-                    new XElement(OpNs + "Reference", data.SalesOrderNumber)
-                )
-            );
-        }
-
-        private static XElement CreateAdditionalInvoiceDates(InvoiceData data)
-        {
-            return new XElement(OpNs + "AdditionalInvoiceDates",
-                new XElement(OpNs + "InvoiceDateTime",
-                    new XAttribute("DateTimeType", "ORD"),
-                    new XAttribute("DateTimeDesc", "Order Date"),
-                    data.OrderDate
-                ),
-                new XElement(OpNs + "InvoiceDateTime",
-                    new XAttribute("DateTimeType", "DEL"),
-                    new XAttribute("DateTimeDesc", "Delivery date")
-                )
-            );
-        }
-
-        #endregion
-
-        #region Party Sections (Supplier, Buyer, InvoiceTo)
-
-        private static XElement CreateSupplier(InvoiceData data)
-        {
-            return new XElement(DefaultNs + "Supplier",
-                new XElement(DefaultNs + "SupplierReferences",
-                    new XElement(DefaultNs + "TaxNumber", data.VATRegistrationNo),
-                    new XElement(DefaultNs + "GLN", data.CompanyRegistrationNo)
-                ),
-                new XElement(DefaultNs + "Party", data.CompanyName),
-                CreateAddressElement(data.CompanyAddress)
-            );
-        }
-
-        private static XElement CreateBuyer(InvoiceData data)
-        {
-            return new XElement(DefaultNs + "Buyer",
-                new XElement(DefaultNs + "BuyerReferences",
-                    new XElement(DefaultNs + "SuppliersCodeForBuyer", data.CustomerAccount)
-                ),
-                new XElement(DefaultNs + "Party", data.CustomerName),
-                CreateAddressElement(data.InvoiceToAddress)
-            );
-        }
-
-        private static XElement CreateInvoiceTo(InvoiceData data)
-        {
-            return new XElement(DefaultNs + "InvoiceTo",
-                new XElement(DefaultNs + "Party", data.InvoiceToName)
-            );
-        }
-
-        private static XElement CreateAddressElement(AddressInfo address)
-        {
-            var addressElement = new XElement(DefaultNs + "Address");
-
-            foreach (var line in address.Lines.Where(l => !string.IsNullOrWhiteSpace(l)))
+            try
             {
-                addressElement.Add(new XElement(DefaultNs + "AddressLine", line));
+                Directory.CreateDirectory(_settings.FolderSettings.InputFolder);
+                Directory.CreateDirectory(_settings.FolderSettings.OutputFolder);
+                Directory.CreateDirectory(_settings.FolderSettings.ArchiveFolder);
+                Directory.CreateDirectory(_settings.FolderSettings.ErrorFolder);
+                Directory.CreateDirectory(_settings.FolderSettings.LogFolder);
+                _logger?.LogInformation("All directories verified/created successfully.");
             }
-
-            if (!string.IsNullOrWhiteSpace(address.PostCode))
+            catch (Exception ex)
             {
-                addressElement.Add(new XElement(DefaultNs + "PostCode", address.PostCode));
-            }
-
-            return addressElement;
-        }
-
-        #endregion
-
-        #region Invoice Lines Section
-
-        private static IEnumerable<XElement> CreateInvoiceLines(InvoiceData data)
-        {
-            int lineNumber = 1;
-            foreach (var item in data.LineItems)
-            {
-                yield return CreateInvoiceLine(item, lineNumber++);
+                _logger?.LogCritical(ex, "Failed to create required directories.  Exiting.");
+                Environment.Exit(1);
             }
         }
 
-        private static XElement CreateInvoiceLine(LineItem item, int lineNumber)
+        private static void LogConfiguration()
         {
-            return new XElement(DefaultNs + "InvoiceLine",
-                new XElement(DefaultNs + "LineNumber", lineNumber),
-                new XElement(DefaultNs + "InvoiceLineReferences",
-                    new XElement(DefaultNs + "OrderLineNumber", item.ItemNumber),
-                    new XElement(DefaultNs + "BuyersOrderLineReference", $"{item.ItemNumber} {item.ProductCode}")
-                ),
-                new XElement(OpNs + "AdditionalInvoiceReferences",
-                    new XElement(OpNs + "InvoiceLineReference",
-                        new XAttribute("ReferenceType", "SETFLG"),
-                        new XAttribute("ReferenceDesc", "Settlement Discount Flag"),
-                        new XElement(OpNs + "Reference", "Y")
-                    )
-                ),
-                new XElement(DefaultNs + "Product",
-                    new XElement(DefaultNs + "SuppliersProductCode", item.ProductCode),
-                    new XElement(DefaultNs + "Description", item.Description)
-                ),
-                new XElement(DefaultNs + "Quantity",
-                    new XElement(DefaultNs + "Packsize", "1"),
-                    new XElement(DefaultNs + "Amount", item.Quantity.ToString("F0"))
-                ),
-                new XElement(DefaultNs + "Price",
-                    new XElement(DefaultNs + "UnitPrice", item.UnitPrice.ToString("F3"))
-                ),
-                new XElement(DefaultNs + "LineTax",
-                    new XElement(DefaultNs + "TaxRate",
-                        new XAttribute("Code", "S"),
-                        item.VATRate.ToString("F2")
-                    )
-                ),
-                new XElement(DefaultNs + "LineTotal", item.LineTotal.ToString("F3"))
-            );
-        }
+            _logger?.LogInformation("");
+            _logger?.LogInformation("Folder Configuration:");
+            _logger?.LogInformation("  Input folder:     {InputFolder}", _settings.FolderSettings.InputFolder);
+            _logger?.LogInformation("  Output folder:   {OutputFolder}", _settings.FolderSettings.OutputFolder);
+            _logger?.LogInformation("  Archive folder:   {ArchiveFolder}", _settings.FolderSettings.ArchiveFolder);
+            _logger?.LogInformation("  Error folder:    {ErrorFolder}", _settings.FolderSettings.ErrorFolder);
+            _logger?.LogInformation("  Log folder:      {LogFolder}", _settings.FolderSettings.LogFolder);
+            _logger?.LogInformation("");
+            _logger?.LogInformation("Email Configuration:");
+            _logger?.LogInformation("  Email notifications: {Enabled}", _settings.EmailSettings.EnableEmailNotifications ? "Enabled" : "Disabled");
 
-        #endregion
-
-        #region Settlement Section
-
-        private static XElement CreateSettlement(InvoiceData data)
-        {
-            return new XElement(DefaultNs + "Settlement",
-                new XElement(DefaultNs + "SettlementTerms",
-                    new XElement(DefaultNs + "DaysFromInvoice", data.PaymentDays)
-                ),
-                new XElement(DefaultNs + "SettlementDiscount",
-                    new XElement(DefaultNs + "PercentDiscount",
-                        new XElement(DefaultNs + "Percentage", data.EarlyPaymentDiscountPercent.ToString("F2"))
-                    ),
-                    new XElement(DefaultNs + "AmountDiscount",
-                        new XElement(DefaultNs + "Amount", "0.00")
-                    )
-                )
-            );
-        }
-
-        #endregion
-
-        #region Tax Summary Section
-
-        private static IEnumerable<XElement> CreateTaxSubTotals(InvoiceData data)
-        {
-            foreach (var vatGroup in data.VATDetails)
+            if (_settings.EmailSettings.EnableEmailNotifications)
             {
-                yield return new XElement(DefaultNs + "TaxSubTotal",
-                    new XElement(DefaultNs + "TaxRate",
-                        new XAttribute("Code", "S"),
-                        vatGroup.Rate.ToString("F2")
-                    ),
-                    new XElement(DefaultNs + "NumberOfLineAtRate", data.LineItems.Count),
-                    new XElement(DefaultNs + "TotalValueAtRate", vatGroup.PrincipleValue.ToString("F3")),
-                    new XElement(DefaultNs + "TaxableValueAtRate", vatGroup.PrincipleValue.ToString("F1")),
-                    new XElement(DefaultNs + "TaxAtRate", vatGroup.VATValue.ToString("F2")),
-                    new XElement(DefaultNs + "NetPaymentAtRate", vatGroup.PrincipleValue.ToString("F3")),
-                    new XElement(DefaultNs + "GrossPaymentAtRate", (vatGroup.PrincipleValue + vatGroup.VATValue).ToString("F3")),
-                    new XElement(DefaultNs + "TaxCurrency",
-                        new XElement(DefaultNs + "Currency",
-                            new XAttribute("Code", data.CurrencyCode),
-                            data.CurrencyCode
-                        )
-                    )
-                );
+                _logger?.LogInformation("  SMTP Server:  {Server}:{Port}", _settings.EmailSettings.SmtpServer, _settings.EmailSettings.SmtpPort);
+                _logger?.LogInformation("  Recipients: {Count} configured", _settings.EmailSettings.Recipients.Count);
+                _logger?.LogInformation("  Daily summary: {Enabled} at {Time}",
+                    _settings.EmailSettings.SendDailySummary ? "Enabled" : "Disabled",
+                    _settings.EmailSettings.DailySummaryTime);
+            }
+
+            _logger?.LogInformation("");
+            _logger?.LogInformation("Watching for XML files...  Press Ctrl+C to stop.");
+            _logger?.LogInformation("");
+        }
+
+        private static async Task TestEmailConfiguration()
+        {
+            Console.WriteLine("\nTesting email configuration...\n");
+
+            if (!_settings.EmailSettings.EnableEmailNotifications)
+            {
+                Console.WriteLine("❌ Email notifications are disabled in configuration.");
+                Console.WriteLine("   Set 'EnableEmailNotifications' to true in appsettings.json");
+                return;
+            }
+
+            if (_settings.EmailSettings.Recipients.Count == 0)
+            {
+                Console.WriteLine("❌ No email recipients configured.");
+                Console.WriteLine("   Add recipients to the 'Recipients' array in appsettings.json");
+                return;
+            }
+
+            Console.WriteLine($"SMTP Server: {_settings.EmailSettings.SmtpServer}:{_settings.EmailSettings.SmtpPort}");
+            Console.WriteLine($"From: {_settings.EmailSettings.SenderEmail}");
+            Console.WriteLine($"To: {string.Join(", ", _settings.EmailSettings.Recipients.ConvertAll(r => r.Email))}");
+            Console.WriteLine("\nSending test email...");
+
+            // Need to create email service for testing
+            using var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
+            var emailLogger = loggerFactory.CreateLogger<EmailService>();
+            var testEmailService = new EmailService(_settings.EmailSettings, emailLogger);
+
+            var success = await testEmailService.SendTestEmailAsync();
+
+            if (success)
+            {
+                Console.WriteLine("\n✅ Test email sent successfully!");
+                Console.WriteLine("   Check your inbox to confirm delivery.");
+            }
+            else
+            {
+                Console.WriteLine("\n❌ Failed to send test email.");
+                Console.WriteLine("   Check your SMTP settings in appsettings.json");
+                Console.WriteLine("   Common issues:");
+                Console.WriteLine("   - Incorrect SMTP server or port");
+                Console.WriteLine("   - Invalid credentials");
+                Console.WriteLine("   - Firewall blocking the connection");
+                Console.WriteLine("   - Less secure app access disabled (for Gmail)");
             }
         }
 
-        #endregion
-
-        #region Invoice Total Section
-
-        private static XElement CreateInvoiceTotal(InvoiceData data)
+        private static async Task ProcessExistingFilesAsync()
         {
-            return new XElement(DefaultNs + "InvoiceTotal",
-                new XElement(DefaultNs + "NumberOfLines", data.LineItems.Count),
-                new XElement(DefaultNs + "NumberOfTaxRates", data.VATDetails.Count),
-                new XElement(DefaultNs + "LinesValueTotal", data.NetTotal.ToString("F3")),
-                new XElement(DefaultNs + "TaxableTotal", data.NetTotal.ToString("F2")),
-                new XElement(DefaultNs + "TaxTotal", data.VATTotal.ToString("F2")),
-                new XElement(DefaultNs + "NetPaymentTotal", data.GrossTotal.ToString("F2")),
-                new XElement(DefaultNs + "GrossPaymentTotal", data.GrossTotal.ToString("F2"))
-            );
-        }
-
-        #endregion
-    }
-
-    #region Data Models
-
-    public class InvoiceData
-    {
-        public string CompanyName { get; set; } = string.Empty;
-        public string VATRegistrationNo { get; set; } = string.Empty;
-        public string CompanyRegistrationNo { get; set; } = string.Empty;
-        public AddressInfo CompanyAddress { get; set; } = new AddressInfo();
-
-        // Invoice Details
-        public string InvoiceNumber { get; set; } = string.Empty;
-        public string CustomerOrderNumber { get; set; } = string.Empty;
-        public string YourReference { get; set; } = string.Empty;
-        public string InvoiceDate { get; set; } = string.Empty;
-        public string OrderDate { get; set; } = string.Empty;
-        public string DespatchDate { get; set; } = string.Empty;
-        public string DespatchNumber { get; set; } = string.Empty;
-        public string SalesOrderNumber { get; set; } = string.Empty;
-
-        // Customer Details
-        public string CustomerAccount { get; set; } = string.Empty;
-        public string CustomerName { get; set; } = string.Empty;
-        public string InvoiceToName { get; set; } = string.Empty;
-        public AddressInfo DeliverToAddress { get; set; } = new AddressInfo();
-        public AddressInfo InvoiceToAddress { get; set; } = new AddressInfo();
-
-        // Currency
-        public string CurrencyCode { get; set; } = "GBP";
-        public string CurrencyName { get; set; } = "Sterling";
-
-        // Payment Terms
-        public int PaymentDays { get; set; } = 30;
-        public decimal EarlyPaymentDiscountPercent { get; set; } = 0;
-
-        // Totals
-        public decimal NetTotal { get; set; }
-        public decimal VATTotal { get; set; }
-        public decimal GrossTotal { get; set; }
-
-        // Line Items and VAT
-        public List<LineItem> LineItems { get; set; } = new List<LineItem>();
-        public List<VATDetail> VATDetails { get; set; } = new List<VATDetail>();
-
-        public InvoiceData(XElement root)
-        {
-            ParseCompanyDetails(root);
-            ParseInvoiceDetails(root);
-            ParseCustomerDetails(root);
-            ParsePricingDetails(root);
-            ParseDespatches(root);
-            ParseVATDetails(root);
-        }
-
-        private void ParseCompanyDetails(XElement root)
-        {
-            var companyDetails = root.Element("CompanyDetails");
-            if (companyDetails != null)
+            var existingFiles = Directory.GetFiles(_settings.FolderSettings.InputFolder, "*.xml");
+            if (existingFiles.Length > 0)
             {
-                CompanyName = companyDetails.Attribute("Name")?.Value ?? string.Empty;
-                VATRegistrationNo = companyDetails.Attribute("VATRegistrationNo")?.Value ?? string.Empty;
-                CompanyRegistrationNo = companyDetails.Attribute("CoRegistrationNo")?.Value ?? string.Empty;
-                CompanyAddress = ParseAddress(companyDetails.Element("Address"));
-            }
-        }
-
-        private void ParseInvoiceDetails(XElement root)
-        {
-            var invoice = root.Element("Invoice");
-            if (invoice != null)
-            {
-                InvoiceNumber = ExtractNumericPart(invoice.Attribute("Number")?.Value ?? string.Empty);
-                CustomerOrderNumber = invoice.Attribute("OurReference")?.Value ?? string.Empty;
-                YourReference = invoice.Attribute("YoueReference")?.Value ?? string.Empty;
-
-                var dates = invoice.Element("Dates");
-                if (dates != null)
+                _logger?.LogInformation("Found {Count} existing file(s) to process.", existingFiles.Length);
+                foreach (var file in existingFiles)
                 {
-                    InvoiceDate = ConvertToIsoDate(dates.Element("InvoiceDate")?.Attribute("Date")?.Value);
-
-                    var invoiceDateStr = dates.Element("InvoiceDate")?.Attribute("Date")?.Value;
-                    var paymentDueDateStr = dates.Element("PaymenrDueDate")?.Attribute("Date")?.Value;
-                    PaymentDays = CalculateDaysDifference(invoiceDateStr, paymentDueDateStr);
+                    await ProcessFileWithRetryAsync(file);
                 }
+            }
+        }
 
-                var pricingDetails = invoice.Element("PricingDetails");
-                if (pricingDetails != null)
+        private static async Task WatchForFilesAsync(CancellationToken cancellationToken)
+        {
+            using var watcher = new FileSystemWatcher(_settings.FolderSettings.InputFolder)
+            {
+                Filter = "*.xml",
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.CreationTime | NotifyFilters.LastWrite,
+                EnableRaisingEvents = true
+            };
+
+            watcher.Created += async (sender, e) =>
+            {
+                _logger?.LogInformation("New file detected: {FileName}", e.Name);
+                await Task.Delay(500);
+                await ProcessFileWithRetryAsync(e.FullPath);
+            };
+
+            watcher.Renamed += async (sender, e) =>
+            {
+                if (e.FullPath.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
                 {
-                    var paymentTerms = pricingDetails.Element("PaymentTerms");
-                    if (paymentTerms != null)
+                    _logger?.LogInformation("File renamed to XML: {FileName}", e.Name);
+                    await Task.Delay(500);
+                    await ProcessFileWithRetryAsync(e.FullPath);
+                }
+            };
+
+            watcher.Error += (sender, e) =>
+            {
+                _logger?.LogError(e.GetException(), "FileSystemWatcher error occurred.");
+            };
+
+            // Track when to send daily summary
+            DateTime? lastSummaryDate = null;
+
+            // Main loop with polling and daily summary check
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(_settings.FolderSettings.PollingIntervalSeconds * 1000, cancellationToken);
+
+                    // Check for any files that might have been missed
+                    var files = Directory.GetFiles(_settings.FolderSettings.InputFolder, "*.xml");
+                    foreach (var file in files)
                     {
-                        EarlyPaymentDiscountPercent = ParseDecimal(paymentTerms.Attribute("EarlyPercent")?.Value);
-                    }
-                }
-            }
-        }
-
-        private void ParseCustomerDetails(XElement root)
-        {
-            var customerDetails = root.Element("Invoice")?.Element("CustomerDetails");
-            if (customerDetails != null)
-            {
-                var customer = customerDetails.Element("Customer");
-                if (customer != null)
-                {
-                    CustomerAccount = customer.Attribute("Account")?.Value ?? string.Empty;
-                    CustomerName = customer.Attribute("Name")?.Value ?? string.Empty;
-                }
-
-                var deliverTo = customerDetails.Element("DeliverTo");
-                if (deliverTo != null)
-                {
-                    DeliverToAddress = ParseAddress(deliverTo.Element("Addess"));
-                    DeliverToAddress.ContactName = deliverTo.Attribute("Name")?.Value ?? string.Empty;
-                }
-
-                var invoiceTo = customerDetails.Element("InvoiceTo");
-                if (invoiceTo != null)
-                {
-                    var invoiceToCustomer = invoiceTo.Element("Customer");
-                    InvoiceToName = invoiceToCustomer?.Attribute("Name")?.Value ?? CustomerName;
-                    InvoiceToAddress = ParseAddress(invoiceTo.Element("Address"));
-                }
-            }
-        }
-
-        private void ParsePricingDetails(XElement root)
-        {
-            var pricingDetails = root.Element("Invoice")?.Element("PricingDetails");
-            if (pricingDetails != null)
-            {
-                var documentCurrency = pricingDetails.Element("DocumentCurrency");
-                if (documentCurrency != null)
-                {
-                    CurrencyCode = documentCurrency.Attribute("DocumentCurrencyCode")?.Value ?? "GBP";
-                    CurrencyName = MapCurrencyName(CurrencyCode);
-                }
-
-                NetTotal = ParseDecimal(pricingDetails.Element("Value")?.Attribute("DocumentValue")?.Value);
-                VATTotal = ParseDecimal(pricingDetails.Element("VAT")?.Element("Value")?.Attribute("DocumentValue")?.Value);
-                GrossTotal = NetTotal + VATTotal;
-            }
-        }
-
-        private void ParseDespatches(XElement root)
-        {
-            var despatches = root.Element("Despatches");
-            if (despatches == null) return;
-
-            var despatch = despatches.Element("Despatch");
-            if (despatch == null) return;
-
-            var despatchDetails = despatch.Element("DepatchDetails");
-            if (despatchDetails != null)
-            {
-                DespatchNumber = despatchDetails.Attribute("DespatchNumber")?.Value ?? string.Empty;
-                DespatchDate = ConvertToIsoDate(despatchDetails.Element("Dates")?.Element("DespatchDate")?.Attribute("Date")?.Value);
-            }
-
-            var salesOrders = despatch.Element("SalesOrders");
-            if (salesOrders != null)
-            {
-                foreach (var salesOrder in salesOrders.Elements("SalesOrder"))
-                {
-                    var orderDetails = salesOrder.Element("SalesOrderDetails");
-                    if (orderDetails != null)
-                    {
-                        SalesOrderNumber = orderDetails.Attribute("SalesOrderNumber")?.Value ?? string.Empty;
-                        OrderDate = ConvertToIsoDate(orderDetails.Element("Dates")?.Element("Document")?.Attribute("Date")?.Value);
+                        await ProcessFileWithRetryAsync(file);
                     }
 
-                    var items = salesOrder.Element("Items");
-                    if (items != null)
+                    // Check if it's time to send daily summary
+                    await CheckAndSendDailySummaryAsync(lastSummaryDate);
+                    if (DateTime.Now.Date != lastSummaryDate?.Date)
                     {
-                        foreach (var item in items.Elements("Item"))
+                        if (TimeSpan.TryParse(_settings.EmailSettings.DailySummaryTime, out var summaryTime))
                         {
-                            LineItems.Add(ParseLineItem(item));
+                            if (DateTime.Now.TimeOfDay >= summaryTime)
+                            {
+                                lastSummaryDate = DateTime.Now.Date;
+                            }
                         }
                     }
                 }
-            }
-
-            var charges = despatch.Element("Charges");
-            if (charges != null)
-            {
-                foreach (var charge in charges.Elements("Charge"))
+                catch (TaskCanceledException)
                 {
-                    var chargeItem = ParseChargeAsLineItem(charge);
-                    if (chargeItem != null)
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Error during polling cycle.");
+                }
+            }
+        }
+
+        private static async Task CheckAndSendDailySummaryAsync(DateTime? lastSummaryDate)
+        {
+            if (!_settings.EmailSettings.SendDailySummary || _emailService == null)
+                return;
+
+            if (!TimeSpan.TryParse(_settings.EmailSettings.DailySummaryTime, out var summaryTime))
+                return;
+
+            var now = DateTime.Now;
+
+            // Check if we should send summary (haven't sent today and it's past the scheduled time)
+            if (lastSummaryDate?.Date != now.Date && now.TimeOfDay >= summaryTime)
+            {
+                // Only send if there was any activity
+                if (_emailService.TodaysSuccessCount > 0 || _emailService.TodaysErrorCount > 0)
+                {
+                    _logger?.LogInformation("Sending scheduled daily summary email...");
+                    await _emailService.SendDailySummaryAsync();
+                }
+            }
+        }
+
+        private static async Task ProcessFileWithRetryAsync(string filePath, int maxRetries = 3)
+        {
+            if (!File.Exists(filePath)) return;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    if (IsFileLocked(filePath))
                     {
-                        LineItems.Add(chargeItem);
+                        _logger?.LogDebug("File is locked, waiting...  (Attempt {Attempt}/{MaxRetries})", attempt, maxRetries);
+                        await Task.Delay(1000 * attempt);
+                        continue;
                     }
+
+                    _processor?.ProcessFile(filePath);
+                    return;
                 }
-            }
-        }
-
-        private LineItem ParseLineItem(XElement item)
-        {
-            var product = item.Element("Product");
-            var quantities = item.Element("Quantites")?.Element("OrderQuantity");
-            var prices = item.Element("Prices")?.Element("UnitPrice");
-            var lineValues = item.Element("LineValues")?.Element("NetLineValue");
-            var vat = item.Element("VAT");
-
-            return new LineItem()
-            {
-                ItemNumber = item.Attribute("ItemNumber")?.Value ?? "1",
-                ProductCode = product?.Attribute("Code")?.Value ?? string.Empty,
-                Description = product?.Attribute("Description1")?.Value ?? string.Empty,
-                Quantity = ParseDecimal(quantities?.Attribute("Quantity")?.Value),
-                UnitOfMeasure = quantities?.Attribute("UOM")?.Value ?? "EACH",
-                UnitPrice = ParseDecimal(prices?.Attribute("DocumentPrice")?.Value),
-                LineTotal = ParseDecimal(lineValues?.Attribute("DocumentValue")?.Value),
-                VATCode = vat?.Attribute("Code")?.Value ?? "ASTD",
-                VATRate = ParseDecimal(vat?.Attribute("Rate")?.Value),
-                VATValue = ParseDecimal(vat?.Element("VATValue")?.Attribute("DocumentValue")?.Value)
-            };
-        }
-
-        private LineItem? ParseChargeAsLineItem(XElement charge)
-        {
-            var chargeValue = ParseDecimal(charge.Element("ChargeValue")?.Attribute("DocumentValue")?.Value);
-            if (chargeValue <= 0) return null;
-
-            var chargeCode = charge.Element("ChargeCode");
-            var vat = charge.Element("VAT");
-
-            return new LineItem()
-            {
-                ItemNumber = "C1",
-                ProductCode = chargeCode?.Attribute("Code")?.Value ?? "CHARGE",
-                Description = chargeCode?.Attribute("Description")?.Value ?? "Charge",
-                Quantity = 1,
-                UnitOfMeasure = "EACH",
-                UnitPrice = chargeValue,
-                LineTotal = chargeValue,
-                VATCode = vat?.Attribute("Code")?.Value ?? "ASTD",
-                VATRate = ParseDecimal(vat?.Attribute("Rate")?.Value),
-                VATValue = ParseDecimal(vat?.Element("VATValue")?.Attribute("DocumentValue")?.Value),
-                IsCharge = true
-            };
-        }
-
-        private void ParseVATDetails(XElement root)
-        {
-            var vatDetails = root.Element("VATDetails");
-            if (vatDetails != null)
-            {
-                foreach (var vat in vatDetails.Elements("VAT"))
+                catch (IOException) when (attempt < maxRetries)
                 {
-                    vatDetails.Add(new VATDetail()
-                    {
-                        Code = vat.Attribute("Code")?.Value ?? string.Empty,
-                        Description = vat.Attribute("Description").Value ?? string.Empty,
-                        Rate = ParseDecimal(vat.Attribute("Rate")?.Value),
-                        PrincipleValue = ParseDecimal(vat.Element("VATPrinciple")?.Attribute("DocumentValue")?.Value),
-                        VATValue = ParseDecimal(vat.Element("VATValue")?.Attribute("DocumentValue")?.Value)
-                    });
+                    _logger?.LogWarning("File access error, retrying... (Attempt {Attempt}/{MaxRetries})", attempt, maxRetries);
+                    await Task.Delay(1000 * attempt);
                 }
-            }
-        }
-
-        #region Helper Methods
-
-        private AddressInfo ParseAddress(XElement? addressElement)
-        {
-            var address = new AddressInfo();
-            if (addressElement == null) return address;
-
-            var lines = new List<string>();
-            for (int i = 1; i <= 6; i++)
-            {
-                var line = addressElement.Attribute($"Line{i}")?.Value;
-                if (!string.IsNullOrWhiteSpace(line))
+                catch (Exception ex)
                 {
-                    lines.Add(line);
+                    _logger?.LogError(ex, "Failed to process file after {Attempts} attempts:  {FilePath}", attempt, filePath);
+                    break;
                 }
             }
-
-            address.Lines = lines;
-            address.PostCode = addressElement.Attribute("PostCode")?.Value ?? string.Empty;
-            address.CountryCode = addressElement.Attribute("CountryCode")?.Value ?? string.Empty;
-            address.Country = addressElement.Attribute("Country")?.Value ?? string.Empty;
-
-            return address;
         }
 
-        private string ConvertToIsoDate(string? dateStr)
+        private static bool IsFileLocked(string filePath)
         {
-            if (string.IsNullOrEmpty(dateStr)) return DateTime.Now.ToString("yyyy-MM-dd");
-
-            if (DateTime.TryParseExact(dateStr, "dd/MM/yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
+            try
             {
-                return date.ToString("yyyy-MM-dd");
+                using var stream = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.None);
+                return false;
             }
-
-            return DateTime.Now.ToString("yyyy-MM-dd");
-        }
-
-        private int CalculateDaysDifference(string? startDateStr, string? endDateStr)
-        {
-            if (string.IsNullOrEmpty(startDateStr) || string.IsNullOrEmpty(endDateStr)) return 30;
-
-            if (DateTime.TryParseExact(startDateStr, "dd/MM/yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, out var startDate) &&
-                DateTime.TryParseExact(endDateStr, "dd/MM/yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, out var endDate))
+            catch (IOException)
             {
-                return (int)(endDate - startDate).TotalDays;
+                return true;
             }
-
-            return 30;
         }
-
-        private string ExtractNumericPart(string value) =>
-            new string(value.Where(char.IsDigit).ToArray());
-
-        private decimal ParseDecimal(string? value)
-        {
-            if (string.IsNullOrEmpty(value)) return 0;
-            return decimal.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var result) ? result : 0;
-        }
-
-        private string MapCurrencyName(string code)
-        {
-            return code switch
-            {
-                "GBP" => "Sterling",
-                "EUR" => "Euro",
-                "USD" => "US Dollar",
-                _ => code
-            };
-        }
-
-        #endregion
     }
-
-    public class AddressInfo
-    {
-        public string ContactName { get; set; } = string.Empty;
-        public List<string> Lines { get; set; } = new List<string>();
-        public string PostCode { get; set; } = string.Empty;
-        public string CountryCode { get; set; } = string.Empty;
-        public string Country { get; set; } = string.Empty;
-    }
-
-    public class LineItem
-    {
-        public string ItemNumber { get; set; } = string.Empty;
-        public string ProductCode { get; set; } = string.Empty;
-        public string Description { get; set; } = string.Empty;
-        public decimal Quantity { get; set; }
-        public string UnitOfMeasure { get; set; } = string.Empty;
-        public decimal UnitPrice { get; set; }
-        public decimal LineTotal { get; set; }
-        public string VATCode { get; set; } = string.Empty;
-        public decimal VATRate { get; set; }
-        public decimal VATValue { get; set; }
-        public bool IsCharge { get; set; }
-    }
-
-    public class VATDetail
-    {
-        public string Code { get; set; } = string.Empty;
-        public string Description { get; set; } = string.Empty;
-        public decimal Rate { get; set; }
-        public decimal PrincipleValue { get; set; }
-        public decimal VATValue { get; set; }
-    }
-
-    #endregion
 }
